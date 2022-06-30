@@ -1,87 +1,128 @@
-import { config as dotenv } from "dotenv";
-import { join } from "path";
-import { plainToClass, classToPlain } from "class-transformer";
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { createClient, setupClient } from "./DiscordHandler";
-import Storage, { ServerStorage } from "./DataStore";
-import { query, getFromNextDays, createAnnouncementEmbed } from "./Util";
-import { GuildTextableChannel } from "eris";
+import { config } from "dotenv";
+config();
+import { ApplicationCommand, Client, CommandInteraction, Intents, MessageComponentInteraction, Snowflake } from "discord.js";
+import { BOT_TOKEN, DEV_SERVER_ID, MODE, SET_ACTIVITY } from "./Constants";
+import { commands } from "./commands/Command";
+import CommandWatch from "./commands/CommandWatch";
+import CommandUnwatch from "./commands/CommandUnwatch";
+import CommandWatching from "./commands/CommandWatching";
+import CommandEdit from "./commands/CommandEdit";
+import CommandTitleFormat from "./commands/CommandTitleFormat";
+import CommandAbout from "./commands/CommandAbout";
+import { initScheduler } from "./Scheduler";
+import CommandUpcoming from "./commands/CommandUpcoming";
+import CommandPermission from "./commands/CommandPermission";
+import { convertDataJson, getUniqueMediaIds } from "./Util";
+import { PrismaClient } from "@prisma/client";
 
-dotenv();
+commands.push(new CommandWatch());
+commands.push(new CommandUnwatch());
+commands.push(new CommandWatching());
+commands.push(new CommandEdit());
+commands.push(new CommandTitleFormat());
+commands.push(new CommandAbout());
+commands.push(new CommandUpcoming());
+commands.push(new CommandPermission());
 
-const scheduleQuery = readFileSync(join(__dirname, "./query/Schedule.graphql"), "utf8");
+const commandIds: Record<string, { id: Snowflake, command: ApplicationCommand }> = {};
+const prisma = new PrismaClient();
+export const client = new Client({
+  intents: [ Intents.FLAGS.GUILDS, Intents.FLAGS.GUILD_MESSAGES ]
+});
 
-const client = createClient();
-setupClient(client);
-const storage: Storage = getOrCreateStorage();
+async function init() {
+  await convertDataJson(prisma); // TODO remove
+  await initScheduler(prisma);
+  await client.login(BOT_TOKEN);
+  console.log(`Logged in as ${client.user.username}#${client.user.discriminator}`);
+}
 
-// Initial run
-handleSchedules(Math.round(getFromNextDays().getTime() / 1000), 1); 
-// Schedule future runs every 24 hours
-setInterval(() => handleSchedules(Math.round(getFromNextDays().getTime() / 1000), 1), 1000 * 60 * 60 * 24); 
+client.on("ready", async () => {
+  const commandManager = MODE === "DEV" ? client.guilds.cache.get(DEV_SERVER_ID as Snowflake).commands : client.application.commands;
+  const response = await commandManager.set(commands.map(c => c.data));
+  response.forEach((command, id) => commandIds[command.name] = { id, command });
 
-client.connect();
+  client.guilds.cache.forEach(async guild => {
+    if (!guild.commands.cache.has(commandIds["permission"].id))
+      return;
+      
+    await guild.commands.permissions.add({
+      command: commandIds["permission"].command,
+      permissions: [
+        {
+          id: guild.ownerId,
+          type: "USER",
+          permission: true
+        }
+      ]
+    });
+  });
 
-function getOrCreateStorage(): Storage {
-  let storage: Storage;
-  if (existsSync("./data.json")) {
-    storage = plainToClass(Storage, JSON.parse(readFileSync("./data.json", "utf8")), {enableCircularCheck: true});
-  } else {
-    storage = new Storage();
-    writeFileSync("./data.json", JSON.stringify(classToPlain(storage)));
+  if (SET_ACTIVITY) {
+    getUniqueMediaIds(prisma).then(uniqueIds => {
+      // Set the initial activity count at launch
+      client.user.setActivity({ type: "WATCHING", name: `${uniqueIds.length} airing anime` });
+    });
   }
+});
 
-  return storage;
-}
+client.on("error", e => {
+  console.log("Error occurred", e);
 
-export function getStorage(): Storage {
-  return storage;
-}
+  // Make sure we stay logged in if we disconnect
+  client.login(BOT_TOKEN)
+});
 
-let queuedMedia: number[] = [];
-async function handleSchedules(time: number, page: number) {
-  const response = await query(scheduleQuery, { page, watched: getAllWatched(storage.servers), nextDay: time });
-  if (response.errors) {
-    console.log(response.errors);
+process.on("unhandledRejection", e => {
+  console.log("Error occurred", e);
+  
+  // Make sure we stay logged in if we disconnect
+  client.login(BOT_TOKEN);
+})
+
+client.on("interactionCreate", async interaction => {
+  // For now, all interactions must be in a guild
+  if (interaction.isCommand() && !interaction.inGuild()) {
+    (interaction as CommandInteraction).reply({
+      content: `${client.user.username} does not allow commands to be used in direct messages at this moment.`
+    });
+    return;
+  }
+    
+  try {
+    if (interaction.isCommand())
+      await handleCommands(interaction);
+
+    if (interaction.isMessageComponent())
+      await handleMessageComponents(interaction);
+  } catch (e) {
+    console.error("Error handing interaction", e);
+  }
+});
+
+async function handleCommands(interaction: CommandInteraction) {
+  const command = commands.find(c => c.data.name === interaction.commandName);
+  if (!command) {
+    console.error(`Discord has passed unknown command "${interaction.commandName}" to us.`);
     return;
   }
 
-  response.data.Page.airingSchedules.forEach((e: any) => {
-    if (queuedMedia.includes(e.id))
-      return;
-
-    const date = new Date(e.airingAt * 1000);
-    console.log(`Scheduling announcement for ${e.media.title.romaji} on ${date.toLocaleDateString()} at ${date.toLocaleTimeString()}`);
-    queuedMedia.push(e.id);
-    setTimeout(() => makeAnnouncement(e, date), e.timeUntilAiring * 1000);
-  });
-
-  if (response.data.Page.pageInfo.hasNextPage)
-    handleSchedules(time, response.data.Page.pageInfo.currentPage + 1);
+  await command.handleInteraction(client, interaction, prisma)
 }
 
-function makeAnnouncement(entry: any, date: Date, upNext = false) {
-  queuedMedia = queuedMedia.filter(q => q !== entry.id);
-  const embed = createAnnouncementEmbed(entry, date, upNext);
-
-  storage.servers.forEach(server => {
-    server.channels.forEach(c => {
-      if (!c.shows.includes(entry.media.id))
-        return;
-      
-      const channel = client.getChannel(c.channelId) as GuildTextableChannel;
-      if (channel) {
-        console.log(`Announcing episode ${entry.media.title.romaji} to ${channel.guild.name}@${channel.id}`);
-        channel.createMessage({ embed });
-        if (entry.media.episodes === entry.episode)
-          c.shows = c.shows.filter(id => id !== entry.media.id);
-      }
-    });
-  });
+async function handleMessageComponents(interaction: MessageComponentInteraction) {
+  // Allow components to use IDs as a way to direct to the correct command by specifying the command name before a ":" 
+  const idSplit = interaction.customId.split(":");
+  const command = commands.find(c => c.data.name === idSplit[0]);
+  if (command) {
+    // Strip the command name off the ID so it can be more useful to the command
+    interaction.customId = idSplit[1];
+    await command.handleMessageComponents(client, interaction, prisma)
+  }
 }
 
-function getAllWatched(storage: ServerStorage[]): number[] {
-  const watched = new Set<number>();
-  storage.forEach(server => server.channels.forEach(channel => channel.shows.forEach(s => watched.add(s))));
-  return Array.from(watched.values())
+init();
+
+export function getCommand(commandName: string): { id: Snowflake, command: ApplicationCommand } | null {
+  return commandIds[commandName];
 }

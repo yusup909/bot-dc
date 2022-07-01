@@ -1,12 +1,10 @@
 {
   "compilerOptions": { 
-    "module": "commonjs",
-    "target": "ES6",
-    "moduleResolution": "node",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
     "removeComments": true,
     "sourceMap": true,
-    "outDir": "./dist",
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true
+    "resolveJsonModule": true,
+    "outDir": "./build"
   }
 }

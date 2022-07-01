@@ -1,5 +1,9 @@
+import { PrismaClient } from "@prisma/client";
+import { existsSync, readFileSync, renameSync } from "fs";
 import fetch from "node-fetch";
-import { Embed, Message, TextableChannel } from "eris";
+import { logger } from "./AniSchedule";
+import { DATA_PATH } from "./Constants";
+import { MediaFormat, MediaTitle, ServerConfigLegacy, ThreadArchiveTime, TitleFormat } from "./Model";
 
 export async function query(query: string, variables?: any) {
   return fetch("https://graphql.anilist.co", {
@@ -36,9 +40,9 @@ export async function getMediaId(input: string): Promise<number | null> {
   if (!match)
     return null;
 
-  return await query("query($malId: Int){Media(idMal:$malId){id}}", {malId: match[1]}).then(res => {
+  return await query("query($malId: Int) { Media(idMal: $malId) { id } }", { malId: match[1] }).then(res => {
     if (res.errors) {
-      console.log(JSON.stringify(res.errors));
+      logger.error(JSON.stringify(res.errors));
       return;
     }
 
@@ -46,62 +50,34 @@ export async function getMediaId(input: string): Promise<number | null> {
   });
 }
 
-export function getFromNextDays(days: number = 1) {
-  return new Date(new Date().getTime() + (24 * 60 * 60 * 1000 * days));
-}
-
-const streamingSites = [
-  "Amazon",
-  "AnimeLab",
-  "Crunchyroll",
-  "Funimation",
-  "Hidive",
-  "Hulu",
-  "Netflix",
-  "Viz",
-  "VRV",
-];
-
-export function createAnnouncementEmbed(entry: any, date: Date, upNext?: boolean): Embed {
-  let description = `Episode ${entry.episode} of [${entry.media.title.romaji}](${entry.media.siteUrl})${upNext ? "" : " has just aired."}`;
-  if (entry.media.externalLinks && entry.media.externalLinks.length > 0) {
-    const streams = [];
-    entry.media.externalLinks.forEach((site: { site: string, url: string }) => {
-      if (streamingSites.find(s => s.toLowerCase() === site.site.toLowerCase()))
-        streams.push(`[${site.site}](${site.url})`);
-    });
-
-    description += "\n\n" + (streams.length > 0 ? "Watch: " + streams.join(" • ") + "\n\nIt may take some time to appear on the above service(s)" : "No licensed streaming links available");
+export function getTitle(title: MediaTitle, wanted: TitleFormat) {
+  switch (wanted) {
+    case "NATIVE": return title.native;
+    case "ROMAJI": return title.romaji;
+    case "ENGLISH": return title.english || title.romaji;
+    default: return title.romaji;
   }
-
-  const format = !entry.media.format ? "" : `Format: ${entry.media.format.includes("_") ? displayify(entry.media.format) : entry.media.format}`;
-  const duration = !entry.media.duration ? "" : `Duration: ${formatTime(entry.media.duration * 60)}`;
-  const studio = !entry.media.studios || entry.media.studios.edges.length === 0 ? "" : `Studio: ${entry.media.studios.edges[0].node.name}`;
-
-  return {
-    color: entry.media.coverImage.color ? parseInt(entry.media.coverImage.color.substr(1), 16) : 43775,
-    thumbnail: {
-      url: entry.media.coverImage.large
-    },
-    author: {
-      name: "AniList",
-      url: "https://anilist.co",
-      icon_url: "https://anilist.co/img/logo_al.png"
-    },
-    description,
-    timestamp: date,
-    footer: {
-      text: [format, duration, studio].filter(e => e.length > 0).join(" • ")
-    }
-  } as Embed;
 }
 
-function displayify(enumVal: string): string {
-  const words = enumVal.split("_");
-  for (let i = 0; i < words.length; i++)
-    words[i] = words[i].substr(0, 1) + words[i].toLowerCase().substr(1);
+export function readableFormat(format: MediaFormat) {
+  switch(format) {
+    case "MOVIE": return "Movie";
+    case "SPECIAL": return "Special";
+    case "TV_SHORT": return "TV Short";
+    default: return format;
+  }
+}
 
-  return words.join(" ");
+export async function getUniqueMediaIds(prisma: PrismaClient): Promise<number[]> {
+  return (await prisma.watchConfig.findMany({
+    where: {
+      completed: false
+    },
+    select: {
+      anilistId: true,
+    },
+    distinct: [ "anilistId" ]
+  })).map(r => r.anilistId);
 }
 
 export function parseTime(seconds: number) {
@@ -136,9 +112,78 @@ export function formatTime(seconds: number, appendSeconds?: boolean) {
   return ret;
 }
 
-export function reply(message: Message, content: string): Promise<Message<TextableChannel>> {
-  return message.channel.createMessage({
-    content,
-    messageReferenceID: message.id
-  });
+export async function convertDataJson(prisma: PrismaClient) {
+  if (!existsSync(DATA_PATH)) {
+    logger.info("Skipping data conversion as the old json format does not exist.")
+    return;
+  }
+
+  const data = JSON.parse(readFileSync(DATA_PATH, "utf-8")) as Record<string, ServerConfigLegacy>;
+  for (const [ serverId, serverConfig ] of Object.entries(data)) {
+    await prisma.serverConfig.create({
+      data: {
+        serverId,
+        titleFormat: serverConfig.titleFormat,
+        permission: serverConfig.permission,
+        permissionRoleId: serverConfig.permissionRoleId
+      }
+    });
+    logger.info(`Converted server config for server ID ${serverId}`)
+
+    for (const watchConfig of serverConfig.watching) {
+      try {
+        await prisma.watchConfig.create({
+          data: {
+            anilistId: watchConfig.anilistId,
+            channelId: watchConfig.channelId,
+            createThreads: watchConfig.createThreads || false,
+            pingRole: watchConfig.pingRole,
+            threadArchiveTime: watchConfig.threadArchiveTime || ThreadArchiveTime.ONE_DAY
+          }
+        });
+        logger.info(`Converted watch config for AniList ID ${watchConfig.anilistId} in channel ${watchConfig.channelId}`);
+      } catch (e) {
+        logger.error(`Failed to convert watch config for media ${watchConfig.anilistId} in channel id ${watchConfig.channelId}: ${e.message || e}`);
+      }
+    }
+  }
+
+  renameSync(DATA_PATH, `${DATA_PATH}.old`);
+
+  await checkCompletion(prisma);
+}
+
+async function checkCompletion(prisma: PrismaClient, page: number = 1) {
+  const ids = (await prisma.watchConfig.findMany({
+    where: {
+      completed: false
+    },
+    select: {
+      anilistId: true
+    },
+    distinct: [ "anilistId" ]
+  })).map(r => r.anilistId);
+  const result = await query("query ($page: Int, $ids: [Int!]) { Page(page: $page) { pageInfo { hasNextPage } media(id_in: $ids) { id status } } }", {
+    page,
+    ids: ids
+  }).then(res => res.data.Page);
+
+  const media: { id: number, status: string }[] = result.media;
+
+  for (const m of media) {
+    if (m.status === "FINISHED" || m.status === "CANCELLED") {
+      const updated = await prisma.watchConfig.updateMany({
+        where: {
+          anilistId: m.id
+        },
+        data: {
+          completed: true
+        }
+      });
+      logger.info(`Updated ${updated.count} configs for ID ${m.id}`);
+    }
+  }
+
+  if (result.pageInfo.hasNextPage)
+    await checkCompletion(prisma, page + 1);
 }
